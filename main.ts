@@ -18,7 +18,16 @@ import { setFlagsFromString } from 'node:v8';
 // The house baseline turns V8's incremental marking off before it imports solve.js,
 // and is timed with it; this entry tunes the flag the same way. It must run before
 // the dynamic import below, so solve.js loads under it.
-setFlagsFromString('--no-incremental-marking');
+//
+// --no-opt: measured ~17% faster end to end than the baseline flag alone
+// (median user+sys 0.60s vs 0.72s on the practice cases, Node 24 on this VM;
+// the gap held across interleaved repeats). The optimizing compiler's
+// background CPU costs more than the interpreter loses on this workload —
+// most of the work is native regex/replace/JSON calls, not JS arithmetic —
+// and the heat counts every thread's CPU, so compiler threads are not free.
+// --single-threaded removes the remaining background-thread CPU (~4% more).
+// Wall time is lower too, far inside the 10s budget.
+setFlagsFromString('--no-incremental-marking --no-opt --single-threaded');
 
 /** --name <value> out of the arguments, or the fallback. */
 function arg(name: string, fallback: string): string {
