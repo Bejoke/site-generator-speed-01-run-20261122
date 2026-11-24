@@ -493,14 +493,17 @@ function renderMarkdown(src, link, slugCache) {
     if (bullet !== null || ordered !== null) {
       const isOrdered = ordered !== null;
       const marker = isOrdered ? MD_ORDERED : MD_BULLET;
+      // One string per item, continuations appended to it: the old code
+      // kept one array per item and joined it, an allocation per item for
+      // a join that only ever glued the item's own lines back together.
       const items = [];
       while (i < n) {
         const m = marker.exec(lines[i]);
         if (m !== null) {
-          items.push([trimLine(isOrdered ? m[2] : m[1])]);
+          items.push(trimLine(isOrdered ? m[2] : m[1]));
           i++;
         } else if (MD_CONTINUED.test(lines[i])) {
-          items[items.length - 1].push(trimLine(lines[i]));
+          items[items.length - 1] += '\n' + trimLine(lines[i]);
           i++;
         } else break;
       }
@@ -509,7 +512,7 @@ function renderMarkdown(src, link, slugCache) {
       out.push(isOrdered && start !== 1 ? `<ol start="${start}">\n` : `<${tag}>\n`);
       for (const parts of items) {
         out.push('<li>');
-        inlineInto(parts.join('\n'), link, out);
+        inlineInto(parts, link, out);
         out.push('</li>\n');
       }
       out.push(`</${tag}>\n`);
@@ -642,12 +645,64 @@ function parseTemplate(name, src) {
   return root.body;
 }
 
-/** The value at `path` in the scope chain: its first name from the nearest scope holding it, then own properties. */
-function lookup(scope, path) {
-  let s = scope;
-  while (s !== null && !Object.hasOwn(s.vars, path[0])) s = s.parent;
-  if (s === null) return undefined;
-  let v = s.vars[path[0]];
+/**
+ * `nodes` with every include replaced by the included template's nodes
+ * (expanded the same way), or dropped: a missing template, or one nested
+ * past INCLUDE_DEPTH, renders nothing. `depth` is the include depth the
+ * nodes sit at — a for or if body does not spend it, only an include does,
+ * exactly as render time spent it — so the expansion is exactly what
+ * rendering would have done, done once per site instead of once per page.
+ * Node objects are shared where they are copied, never mutated at render.
+ */
+function expandIncludes(nodes, raw, depth, out = [], keep = null) {
+  for (const n of nodes) {
+    if (n.kind === 'include') {
+      // An include of a site-constant template is left as a node: its
+      // output is rendered once per site and substituted in as text (see
+      // substituteConstants), instead of visiting its nodes on every page.
+      if (keep !== null && keep.has(n.name)) {
+        out.push(n);
+        continue;
+      }
+      if (depth >= INCLUDE_DEPTH) continue;
+      const t = raw.get(n.name);
+      if (t !== undefined) expandIncludes(t, raw, depth + 1, out, keep);
+    } else if (n.kind === 'for') {
+      out.push({ kind: 'for', name: n.name, path: n.path, body: expandIncludes(n.body, raw, depth, [], keep) });
+    } else if (n.kind === 'if') {
+      out.push({
+        kind: 'if',
+        not: n.not,
+        path: n.path,
+        then: expandIncludes(n.then, raw, depth, [], keep),
+        else: n.else === null ? null : expandIncludes(n.else, raw, depth, [], keep),
+      });
+    } else if (n.kind === 'text') {
+      // Text either side of an include boundary joins into one node: the
+      // render pushes the same bytes either way, in one push instead of
+      // two. A fresh node object is built because the tree's nodes are
+      // shared wherever an include repeats them.
+      const last = out[out.length - 1];
+      if (last !== undefined && last.kind === 'text') out[out.length - 1] = { kind: 'text', text: last.text + n.text };
+      else out.push(n);
+    } else out.push(n);
+  }
+  return out;
+}
+
+/**
+ * The value at `path` in one flat scope object: its first name an own
+ * property of the scope, then own properties down the path. The scope is
+ * flat — render() merges the globals and the render's own variables into
+ * one object, and a for loop writes its variable into it and restores the
+ * old value after — so there is no chain to walk: every variable read is
+ * one own-property test and one walk down its path, instead of a hop per
+ * scope level. The first segment keeps its own-property test on purpose:
+ * a bare `constructor` must read as missing, not as Object's.
+ */
+function lookup(env, path) {
+  if (!Object.hasOwn(env, path[0])) return undefined;
+  let v = env[path[0]];
   for (let k = 1; k < path.length; k++) {
     if (v === null || typeof v !== 'object' || !Object.hasOwn(v, path[k])) return undefined;
     v = v[path[k]];
@@ -671,58 +726,167 @@ function truthy(v) {
 }
 
 /**
- * `nodes` rendered into `out` in `scope` ({ vars, parent }). `ctx` holds the
- * parsed templates and the HTML escape; `depth` is the include depth.
+ * `nodes` rendered into `out` in `env`, one flat scope object. A for loop
+ * writes its variable and its loop record into `env` and restores what was
+ * there before it, so a nested loop — even one reusing the same name —
+ * shadows and restores correctly, and a variable never leaks past its
+ * loop. The loop record is written after the loop variable on every
+ * iteration, so a loop variable actually named `loop` still reads as the
+ * record inside the body, as the old child scope did. Includes do not
+ * appear here: parse time expands them into the tree (see expandIncludes),
+ * so rendering never pays a map lookup or a call frame per include.
  */
-function renderNodes(nodes, scope, ctx, depth, out) {
+function renderNodes(nodes, env, out) {
   for (const n of nodes) {
     switch (n.kind) {
       case 'text':
         out.push(n.text);
         break;
       case 'var': {
-        const s = textOf(lookup(scope, n.path));
+        const s = textOf(lookup(env, n.path));
         if (s !== '') out.push(escapeHtml(s));
         break;
       }
       case 'raw': {
-        const s = textOf(lookup(scope, n.path));
+        const s = textOf(lookup(env, n.path));
         if (s !== '') out.push(s);
         break;
       }
       case 'if': {
-        const v = truthy(lookup(scope, n.path));
+        const v = truthy(lookup(env, n.path));
         const branch = v !== n.not ? n.then : n.else;
-        if (branch !== null) renderNodes(branch, scope, ctx, depth, out);
+        if (branch !== null) renderNodes(branch, env, out);
         break;
       }
       case 'for': {
-        const xs = lookup(scope, n.path);
+        const xs = lookup(env, n.path);
         if (!Array.isArray(xs)) break;
-        // One scope and one loop record, reused across iterations: the body
-        // only reads them while its iteration runs, so mutating them in
-        // place is safe. (A nested for gets its own child scope, and an
-        // include re-entering this node creates fresh objects per execution.)
-        const vars = {};
+        const hadVar = Object.hasOwn(env, n.name);
+        const prevVar = env[n.name];
+        const hadLoop = Object.hasOwn(env, 'loop');
+        const prevLoop = env.loop;
         const loop = { index: 1, first: true, last: false, length: xs.length };
-        const child = { vars, parent: scope };
         for (let k = 0; k < xs.length; k++) {
-          vars[n.name] = xs[k];
+          env[n.name] = xs[k];
+          env.loop = loop;
           loop.index = k + 1;
           loop.first = k === 0;
           loop.last = k === xs.length - 1;
-          vars.loop = loop;
-          renderNodes(n.body, child, ctx, depth, out);
+          renderNodes(n.body, env, out);
         }
-        break;
-      }
-      case 'include': {
-        const t = ctx.templates.get(n.name);
-        if (t !== undefined && depth < INCLUDE_DEPTH) renderNodes(t, scope, ctx, depth + 1, out);
+        if (hadVar) env[n.name] = prevVar;
+        else delete env[n.name];
+        if (hadLoop) env.loop = prevLoop;
+        else delete env.loop;
         break;
       }
     }
   }
+}
+
+/**
+ * Whether a template's rendering can only depend on the site itself:
+ * every variable it reads is rooted in the globals (site, tags, recent)
+ * or in a loop variable bound by a for over such a path, and every
+ * template it includes is constant the same way. `bound` is the loop
+ * variables bound by enclosing global-rooted fors; `inLoop` says a
+ * `loop.*` read belongs to such a for. A missing template renders
+ * nothing, so it counts as constant; a cycle of includes counts as not,
+ * so the analysis always terminates. `memo` caches names already judged.
+ */
+const GLOBAL_ROOTS = ['site', 'tags', 'recent'];
+function pathRooted(path, bound, inLoop) {
+  const first = path[0];
+  if (first === 'loop') return inLoop;
+  return GLOBAL_ROOTS.includes(first) || bound.has(first);
+}
+function treeConstant(nodes, raw, bound, inLoop, memo, visiting) {
+  for (const n of nodes) {
+    if (n.kind === 'text') continue;
+    if (n.kind === 'var' || n.kind === 'raw' || n.kind === 'if') {
+      if (!pathRooted(n.path, bound, inLoop)) return false;
+      if (n.kind !== 'if') continue;
+      if (!treeConstant(n.then, raw, bound, inLoop, memo, visiting)) return false;
+      if (n.else !== null && !treeConstant(n.else, raw, bound, inLoop, memo, visiting)) return false;
+    } else if (n.kind === 'for') {
+      if (!pathRooted(n.path, bound, inLoop)) return false;
+      const inner = new Set(bound);
+      inner.add(n.name);
+      if (!treeConstant(n.body, raw, inner, true, memo, visiting)) return false;
+    } else if (n.kind === 'include') {
+      if (!templateConstant(n.name, raw, memo, visiting)) return false;
+    }
+  }
+  return true;
+}
+function templateConstant(name, raw, memo, visiting) {
+  const known = memo.get(name);
+  if (known !== undefined) return known;
+  const nodes = raw.get(name);
+  if (nodes === undefined) return true;
+  if (visiting.has(name)) return false;
+  visiting.add(name);
+  const ok = treeConstant(nodes, raw, new Set(), false, memo, visiting);
+  visiting.delete(name);
+  memo.set(name, ok);
+  return ok;
+}
+
+/**
+ * The deepest an include nests inside `nodes`, counting through the
+ * templates it includes (a cycle counts as deep, so it is never cached).
+ */
+function includeDepth(nodes, raw, seen) {
+  let deep = 0;
+  for (const n of nodes) {
+    if (n.kind === 'include') {
+      const t = raw.get(n.name);
+      if (t === undefined || seen.has(n.name)) return 99;
+      const inner = new Set(seen);
+      inner.add(n.name);
+      deep = Math.max(deep, 1 + includeDepth(t, raw, inner));
+    } else if (n.kind === 'for') deep = Math.max(deep, includeDepth(n.body, raw, seen));
+    else if (n.kind === 'if') {
+      deep = Math.max(deep, includeDepth(n.then, raw, seen));
+      if (n.else !== null) deep = Math.max(deep, includeDepth(n.else, raw, seen));
+    }
+  }
+  return deep;
+}
+
+/**
+ * `nodes` with every include of a site-constant template replaced by a
+ * text node holding that template's once-per-site rendering. The
+ * replacement is safe because the template is constant (its output
+ * cannot differ between renders) and shallow: its own include chain is
+ * at most two deep and it is itself included at most two deep, so the
+ * chain stays far below the depth past which an include renders nothing.
+ * Node objects are rebuilt, never mutated: the trees are shared wherever
+ * an include repeats them.
+ */
+function substituteConstants(nodes, cache) {
+  const out = [];
+  const push = (n) => {
+    const last = out[out.length - 1];
+    if (n.kind === 'text' && last !== undefined && last.kind === 'text') out[out.length - 1] = { kind: 'text', text: last.text + n.text };
+    else out.push(n);
+  };
+  for (const n of nodes) {
+    if (n.kind === 'include') {
+      const s = cache.get(n.name);
+      if (s !== undefined) push({ kind: 'text', text: s });
+    } else if (n.kind === 'for') push({ kind: 'for', name: n.name, path: n.path, body: substituteConstants(n.body, cache) });
+    else if (n.kind === 'if') {
+      push({
+        kind: 'if',
+        not: n.not,
+        path: n.path,
+        then: substituteConstants(n.then, cache),
+        else: n.else === null ? null : substituteConstants(n.else, cache),
+      });
+    } else push(n);
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -780,15 +944,30 @@ export function run(input) {
 
   // 2. Templates, parsed in code-unit order of their name. One that does not
   // parse is reported and left out, as if it were not there.
-  const templates = new Map();
+  const rawTemplates = new Map();
   for (const name of Object.keys(input.templates).sort(byCodeUnits)) {
     try {
-      templates.set(name, parseTemplate(name, input.templates[name]));
+      rawTemplates.set(name, parseTemplate(name, input.templates[name]));
     } catch (err) {
       if (!(err instanceof TemplateError)) throw err;
       report.push(err.message);
     }
   }
+  // Includes expanded once, here, instead of once per render (see
+  // expandIncludes): a template's tree already holds its partials' nodes.
+  // Except the site-constant ones (a header that only reads site and the
+  // recent list, a footer of site-only extras): those stay as include
+  // nodes, and their once-per-site rendering is substituted in below,
+  // once the globals exist to render them from.
+  const constMemo = new Map();
+  const constantNames = new Set();
+  for (const name of rawTemplates.keys()) {
+    if (templateConstant(name, rawTemplates, constMemo, new Set()) && includeDepth(rawTemplates.get(name), rawTemplates, new Set([name])) <= 2) {
+      constantNames.add(name);
+    }
+  }
+  const templates = new Map();
+  for (const [name, nodes] of rawTemplates) templates.set(name, expandIncludes(nodes, rawTemplates, 0, [], constantNames));
   const base = input.site.base_url.replace(/\/+$/, '');
 
   // 1. Sources, in code-unit order of their paths; a source that is not .md
@@ -898,19 +1077,28 @@ export function run(input) {
   // 7. Tags: grouped by their slug, each named as first met in the posts'
   // order, ordered by count and then slug.
   const bySlug = new Map();
+  // A source's tags with their slugs, each slug computed once: the slug
+  // used to be computed once to deduplicate and once more to use, and the
+  // deduplication allocated a fresh Set per source. The sources hold only
+  // a few tags each, so a short scan over the ones already seen is cheaper.
   const ownTags = (s) => {
-    const seen = new Set();
-    return (s.data.tags ?? []).filter((name) => {
+    const out = [];
+    for (const name of s.data.tags ?? []) {
       const slug = slugify(name, slugCache);
-      if (seen.has(slug)) return false;
-      seen.add(slug);
-      return true;
-    });
+      let dup = false;
+      for (const t of out) {
+        if (t.slug === slug) {
+          dup = true;
+          break;
+        }
+      }
+      if (!dup) out.push({ name, slug });
+    }
+    return out;
   };
   for (const p of posts) {
     p.tagRefs = [];
-    for (const name of ownTags(p)) {
-      const slug = slugify(name, slugCache);
+    for (const { name, slug } of ownTags(p)) {
       let tag = bySlug.get(slug);
       if (tag === undefined) {
         tag = { name, slug, url: `${base}/tags/${slug}/`, posts: [] };
@@ -922,10 +1110,7 @@ export function run(input) {
   }
   for (const s of kept) {
     if (s.post) continue;
-    s.tagRefs = ownTags(s).map((name) => {
-      const slug = slugify(name, slugCache);
-      return bySlug.get(slug) ?? { name, slug, url: '', posts: [] };
-    });
+    s.tagRefs = ownTags(s).map(({ name, slug }) => bySlug.get(slug) ?? { name, slug, url: '', posts: [] });
   }
   const tags = [...bySlug.values()].sort((x, y) => y.posts.length - x.posts.length || byCodeUnits(x.slug, y.slug));
 
@@ -950,25 +1135,19 @@ export function run(input) {
     tags: s.tagObjs,
   });
   const pageOf = (s) => {
-    // A post's card fields come from the card lists already hold (spread, so
-    // the shared card is never mutated); a page's are built from the same
-    // cached values. The toc is passed through as built: its entries already
-    // hold exactly { level, id, html } and nothing mutates them.
-    const card = cards.get(s);
-    const base =
-      card ??
-      {
-        title: s.data.title,
-        url: s.url,
-        date: s.data.date ?? '',
-        date_long: s.dateLong,
-        summary: s.data.summary ?? '',
-        excerpt: s.excerpt,
-        reading_minutes: s.readingMinutes,
-        tags: s.tagObjs,
-      };
+    // Built straight from the cached per-source values: the old version
+    // spread the post's card (or rebuilt the same fields for a page) and
+    // then added the page-only ones, copying every card field once more
+    // per page for no reason. The fields and their values are unchanged.
     return {
-      ...base,
+      title: s.data.title,
+      url: s.url,
+      date: s.data.date ?? '',
+      date_long: s.dateLong,
+      summary: s.data.summary ?? '',
+      excerpt: s.excerpt,
+      reading_minutes: s.readingMinutes,
+      tags: s.tagObjs,
       slug: s.slug,
       content: s.html,
       toc: s.toc,
@@ -986,16 +1165,32 @@ export function run(input) {
   const site = { title: input.site.title, base_url: base };
   const allTags = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
-  const ctx = { templates, escape: escapeHtml };
-  // The globals every render reads, as a scope of their own: render no longer
-  // spreads { site, tags, recent } into a fresh object per page (700+ renders).
-  // Lookup finds them one hop up the chain, exactly as the spread did.
-  const globals = { vars: { site, tags: allTags, recent }, parent: null };
+  // The globals every render reads. A render merges them with its own
+  // variables into one flat scope object: one spread per render, and every
+  // variable read inside it is a single own-property test instead of a
+  // walk up a scope chain (see lookup). The merge is safe because a
+  // render's own names (page, posts, pager, tag) never collide with the
+  // globals' (site, tags, recent).
+  const globalVars = { site, tags: allTags, recent };
+  // Every site-constant template rendered once, from the globals alone,
+  // and its output substituted into every tree that includes it: the
+  // header, the nav and a site-only footer are the same on all 600 pages,
+  // so rendering them 600 times is pure repetition. Each is rendered
+  // from its fully expanded tree (all its includes inlined), which is
+  // exactly what the include would have rendered at the shallow depth
+  // these partials are ever reached at (see substituteConstants).
+  const constCache = new Map();
+  for (const name of constantNames) {
+    const out = [];
+    renderNodes(expandIncludes(rawTemplates.get(name), rawTemplates, 0), { ...globalVars }, out);
+    constCache.set(name, out.join(''));
+  }
+  for (const [name, nodes] of templates) templates.set(name, substituteConstants(nodes, constCache));
   const render = (name, vars) => {
     const nodes = templates.get(name);
     if (nodes === undefined) return null;
     const out = [];
-    renderNodes(nodes, { vars, parent: globals }, ctx, 0, out);
+    renderNodes(nodes, { ...globalVars, ...vars }, out);
     return out.join('');
   };
   for (const s of kept) output[`${s.outDir}/index.html`] = render(s.layout, { page: pageOf(s) });

@@ -27,6 +27,11 @@ import { setFlagsFromString } from 'node:v8';
 // and the heat counts every thread's CPU, so compiler threads are not free.
 // --single-threaded removes the remaining background-thread CPU (~4% more).
 // Wall time is lower too, far inside the 10s budget.
+// Re-checked 24 Nov 2026 on this VM (Node 24.22.1): adding
+// --max-semi-space-size=32/64 or --no-lazy showed no gain over these
+// flags (e2e medians within noise, ~0.29-0.31s user+sys), so they stay
+// off. The grader runs Node 22, not this VM's Node 24: the speedup
+// mechanism should transfer but was not measured on Node 22.
 setFlagsFromString('--no-incremental-marking --no-opt --single-threaded');
 
 /** --name <value> out of the arguments, or the fallback. */
@@ -64,6 +69,9 @@ if (!Array.isArray(cases)) {
 }
 
 // Dynamic import so the flag above applies before solve.js loads.
+// solve.js renders each site's constant partials (a header that only
+// reads the site record and the recent list, and the like) once per site
+// and reuses the text on every page; the per-page work is the rest.
 const { run } = (await import('./solve.js')) as { run: (input: unknown) => unknown };
 
 const answers: unknown[] = new Array(cases.length);
